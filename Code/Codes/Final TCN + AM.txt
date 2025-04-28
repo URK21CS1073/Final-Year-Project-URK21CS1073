@@ -1,0 +1,163 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, Conv1D, BatchNormalization, Dropout, ReLU, Flatten, Add, Dense, Multiply,
+    GlobalAveragePooling1D, Reshape
+)
+from tensorflow.keras.optimizers import Adam
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.linear_model import LassoCV
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score
+)
+import time
+import matplotlib.pyplot as plt
+from tqdm import tqdm  # Progress bar
+
+# Load dataset
+df = pd.read_csv('/kaggle/input/har-dataset/Human_Activity_Recognition_Using_Smartphones_Data.csv')
+
+# Encode target labels
+label_encoder = LabelEncoder()
+df['Activity'] = label_encoder.fit_transform(df['Activity'])
+
+# Separate features and target
+X = df.drop(columns=['Activity']).values
+y = df['Activity'].values
+
+# Feature Scaling
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Feature Selection using LASSO
+lasso = LassoCV(cv=5, random_state=42)
+lasso.fit(X_scaled, y)
+
+# Extract absolute coefficients from the best alpha model
+feature_importance = np.abs(lasso.coef_)
+
+# Get feature names
+feature_names = df.drop(columns=["Activity"]).columns
+
+# Select top 150 features based on importance
+sorted_idx = np.argsort(feature_importance)[::-1][:150]  # Select top 150 features 
+selected_features = np.array(feature_names)[sorted_idx]
+num_features = len(selected_features)  # Get number of selected features
+
+# Print the number of selected features
+print(f"Number of features used for model training: {num_features}")
+
+# Select corresponding columns from scaled dataset
+X_selected = X_scaled[:, sorted_idx]
+
+# Train-test split
+X_train, X_test, y_train, y_test = train_test_split(X_selected, y, test_size=0.2, random_state=42)
+
+# Reshape for TCN input
+X_train = X_train[..., np.newaxis]
+X_test = X_test[..., np.newaxis]
+
+# Define Attention Mechanism
+def attention_block(inputs):
+    """Attention Mechanism"""
+    avg_pool = GlobalAveragePooling1D()(inputs)
+    dense1 = Dense(units=inputs.shape[-1], activation="relu")(avg_pool)
+    dense2 = Dense(units=inputs.shape[-1], activation="sigmoid")(dense1)
+    attention = Multiply()([inputs, Reshape((1, inputs.shape[-1]))(dense2)])
+    return attention
+
+# Define TCN Residual Block with Dilated Convolutions
+def residual_block(x, filters, dilation_rate):
+    """TCN Residual Block"""
+    conv1 = Conv1D(filters=filters, kernel_size=3, padding='causal', dilation_rate=dilation_rate)(x)
+    bn1 = BatchNormalization()(conv1)
+    relu1 = ReLU()(bn1)
+    dropout1 = Dropout(0.3)(relu1)
+
+    conv2 = Conv1D(filters=filters, kernel_size=3, padding='causal', dilation_rate=dilation_rate)(dropout1)
+    bn2 = BatchNormalization()(conv2)
+    relu2 = ReLU()(bn2)
+
+    # Residual Connection
+    res = Add()([x, relu2])
+    
+    return res
+
+# Cross-validation setup
+kf = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
+best_accuracy = 0
+best_model = None
+best_training_time = None
+
+# Cross-validation loop
+with tqdm(total=kf.get_n_splits(), desc="Running Cross-Validation", unit="split") as pbar:
+    for train_index, val_index in kf.split(X_train, y_train):
+        X_tr, X_val = X_train[train_index], X_train[val_index]
+        y_tr, y_val = y_train[train_index], y_train[val_index]
+
+        # Define TCN Model
+        input_layer = Input(shape=(X_train.shape[1], 1))
+        
+        # TCN Residual Blocks with Dilated Convolutions
+        res_block1 = residual_block(input_layer, filters=64, dilation_rate=1)
+        res_block2 = residual_block(res_block1, filters=64, dilation_rate=2)
+        res_block3 = residual_block(res_block2, filters=64, dilation_rate=4)
+
+        # Attention Mechanism
+        attention_output = attention_block(res_block3)
+
+        flatten = Flatten()(attention_output)
+        dense1 = Dense(128, activation='relu')(flatten)
+        dropout2 = Dropout(0.3)(dense1)
+        output_layer = Dense(len(np.unique(y)), activation='softmax')(dropout2)
+
+        model = Model(inputs=input_layer, outputs=output_layer)
+        model.compile(optimizer=Adam(learning_rate=0.001), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+        # Train the model and track training time
+        start_train_time = time.time()
+        history = model.fit(X_tr, y_tr, epochs=20, batch_size=32, validation_data=(X_val, y_val), verbose=0)
+        training_time = time.time() - start_train_time
+
+        # Evaluate the model
+        val_accuracy = model.evaluate(X_val, y_val, verbose=0)[1]
+        if val_accuracy > best_accuracy:
+            best_accuracy = val_accuracy
+            best_model = model
+            best_training_time = training_time
+
+        pbar.update(1)  # Update progress bar
+
+# Evaluate the best model
+start_time = time.time()
+y_pred_prob = best_model.predict(X_test)
+inference_time = time.time() - start_time
+y_pred = np.argmax(y_pred_prob, axis=1)
+
+# Metrics Calculation
+accuracy = accuracy_score(y_test, y_pred)
+precision = precision_score(y_test, y_pred, average='weighted')
+recall = recall_score(y_test, y_pred, average='weighted')
+f1 = f1_score(y_test, y_pred, average='weighted')
+cm = confusion_matrix(y_test, y_pred)
+roc_auc = roc_auc_score(tf.keras.utils.to_categorical(y_test), y_pred_prob, multi_class='ovr')
+
+# Specificity Calculation
+specificity = np.mean(np.diag(cm) / np.sum(cm, axis=1))
+
+# Print Metrics
+print(f"Features used for model training: {num_features}")
+print(f"Model Test Accuracy: {accuracy:.4f}")
+print(f"Precision: {precision:.4f}")
+print(f"Recall (Sensitivity): {recall:.4f}")
+print(f"Specificity: {specificity:.4f}")
+print(f"F1-Score: {f1:.4f}")
+print(f"ROC AUC: {roc_auc:.4f}")
+print(f"Training Time (Best Model): {best_training_time:.2f} seconds")
+print(f"Inference Time: {inference_time:.2f} seconds")
